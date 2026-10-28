@@ -1,0 +1,8 @@
+{
+  "name": "no-huddle-online",
+  "private": true,
+  "type": "module",
+  "description": "No Huddle online game server (prebuilt bundle).",
+  "engines": { "node": ">=20" },
+  "scripts": { "start": "node server.mjs" }
+}

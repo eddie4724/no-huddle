@@ -1,0 +1,21 @@
+# Render Blueprint for the public website's online mode (goes in the root of the
+# website repository, next to index.html). The server is the prebuilt one-file
+# bundle in server/server.mjs (npm run build:deploy-server).
+services:
+  - type: web
+    name: no-huddle-online
+    runtime: node
+    plan: free
+    rootDir: server
+    buildCommand: npm install
+    startCommand: node server.mjs
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: ALLOWED_ORIGINS
+        value: https://eddie4724.github.io
+      - key: MATCH_HALF_SECONDS
+        value: "120"
+      - key: RECONNECT_GRACE_SECONDS
+        value: "30"
