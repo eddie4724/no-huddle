@@ -3919,8 +3919,9 @@ function clampThrowDist(d, passType = 1, arm = 1) {
   return Math.max(THROW_MIN_DIST, Math.min(maxThrowDist(passType, arm), d));
 }
 function throwDuration(dist2, _passType = 1) {
-  return blendSpec(dist2, (s) => s.dur(dist2));
+  return blendSpec(dist2, (s) => s.dur(dist2)) * THROW_TIME_SCALE;
 }
+var THROW_TIME_SCALE = 0.75;
 function throwPeak(dist2, _passType = 1) {
   return blendSpec(dist2, (s) => s.peak(dist2));
 }
