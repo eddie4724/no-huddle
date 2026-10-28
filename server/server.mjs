@@ -3766,7 +3766,6 @@ var DEAD_SECONDS = 2;
 var SCORE_SECONDS = 3;
 var HALFTIME_SECONDS = 4;
 var PREGAME_SECONDS = 2.5;
-var LATE_HALF_SECONDS = 30;
 var MAX_PLAY_SECONDS = 15;
 var TIMEOUTS_PER_HALF = 3;
 var START_LOS = 25;
@@ -3938,7 +3937,7 @@ var STUN_TIME = 0.6;
 var BLOCK_R = 1.25;
 var BLOCK_R_LINE = 1.65;
 var BLOCK_SLOW = 0.18;
-var SHED_TIME_LINE = 2.6;
+var SHED_TIME_LINE = 3.1;
 var SHED_TIME_OPEN = 1.1;
 var SHED_IMMUNE = 1;
 var SEPARATION_R = 0.7;
@@ -4303,7 +4302,7 @@ function applyOutcome(s, o) {
         else res = result(gained >= 0 ? "gain" : "loss", ydsText.toUpperCase(), "", off, gained);
       }
       if (o.sack) s.stats[def].sacks += 1;
-      s.clockRunsBetween = !o.oob && !s.ot && s.clock > LATE_HALF_SECONDS;
+      s.clockRunsBetween = !o.oob && !s.ot;
       break;
     }
   }
@@ -4312,10 +4311,18 @@ function applyOutcome(s, o) {
   return { result: res, scored, possessionChanged: changed };
 }
 function endOfHalf(s) {
+  const q = s.quarter ?? (s.half === 2 ? 4 : 2);
+  if (q === 1 || q === 3) {
+    s.quarter = q + 1;
+    s.clock = s.halfSeconds;
+    s.clockRunsBetween = false;
+    return "quarter";
+  }
   s.timeouts = [TIMEOUTS_PER_HALF, TIMEOUTS_PER_HALF];
   s.pendingKick = null;
-  if (s.half === 1) {
+  if (q === 2) {
     s.half = 2;
+    s.quarter = 3;
     s.clock = s.halfSeconds;
     startPossession(s, other(s.firstPossession), START_LOS);
     if (s.kickoffs) s.pendingKick = { kicker: s.firstPossession, from: KO_FROM };
@@ -4347,7 +4354,7 @@ var ROOM_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ";
 var ROOM_CODE_LENGTH = 4;
 var CODE_RE = new RegExp(`^[${ROOM_CODE_ALPHABET}]{${ROOM_CODE_LENGTH}}$`);
 var TOKEN_RE = /^[0-9a-f]{32}$/;
-var CALL_RE = /^[a-z]{2,12}$/;
+var CALL_RE = /^[a-z0-9]{2,16}$/;
 function parseClientMsg(raw) {
   if (typeof raw !== "string" || raw.length > MAX_MESSAGE_BYTES) return null;
   let m;
@@ -4546,7 +4553,8 @@ function snapshotToWire(s, includeStats) {
     s.myAuto,
     s.changesLeft,
     s.throwMax,
-    s.callMax
+    s.callMax,
+    s.quarter
   ];
 }
 
@@ -5411,9 +5419,38 @@ var STANDARD_TUNING = {
   paBite: 0.8,
   jump: 0.9
 };
+var FRIENDLY_TUNING = {
+  id: "friendly",
+  reactThrow: 0.3,
+  breakSpeed: 0.95,
+  manCushion: 0.95,
+  manLead: 0.08,
+  deepCushion: 2.2,
+  zoneSqueeze: 0.6,
+  contestMult: 0.85,
+  intMult: 0.85,
+  tackleR: 0.78,
+  brokenTackleMult: 1.25,
+  shedMult: 1.5,
+  scrambleReact: 1,
+  contain: false,
+  pursuitLead: 0.7,
+  adapt: 0.3,
+  disguise: 0.05,
+  blitzRate: 0.12,
+  jukeResist: 0.1,
+  ballReach: 0.95,
+  jamBeat: 0.45,
+  jamTime: 0.4,
+  help: 0.1,
+  coordinator: 0.2,
+  callTemp: 4,
+  paBite: 1,
+  jump: 0.4
+};
 var override = null;
 function tuningFor(id) {
-  const t = id === "rookie" || id === "pro" || id === "allpro" || id === "nohuddle" ? AI_TUNING[id] : STANDARD_TUNING;
+  const t = id === "rookie" || id === "pro" || id === "allpro" || id === "nohuddle" ? AI_TUNING[id] : id === "friendly" ? FRIENDLY_TUNING : STANDARD_TUNING;
   return override ? { ...t, ...override } : t;
 }
 
@@ -5488,6 +5525,7 @@ function createMatch(opts) {
     frameSide: 0,
     firstPossession: 0,
     half: 1,
+    quarter: 1,
     clock: opts.halfSeconds ?? HALF_SECONDS,
     halfSeconds: opts.halfSeconds ?? HALF_SECONDS,
     teamSpeed: opts.teamSpeed ?? [1, 1],
@@ -5537,6 +5575,7 @@ function createMatch(opts) {
     conv: null,
     pendingKick: null,
     aiLevel: [opts.difficulty?.[0] ?? null, opts.difficulty?.[1] ?? null],
+    friendly: !!opts.friendly,
     scout: [{}, {}],
     scrambles: [0, 0],
     disguise: null,
@@ -5572,7 +5611,7 @@ function roleOf(s, p) {
   return p.team === s.possession ? OFF_ROLES[p.slot] : DEF_ROLES[p.slot];
 }
 function T(s, side) {
-  return tuningFor(s.aiLevel?.[side]);
+  return tuningFor(s.aiLevel?.[side] ?? (s.friendly ? "friendly" : null));
 }
 function dist(ax, ay, bx, by) {
   return Math.hypot(ax - bx, ay - by);
@@ -5635,8 +5674,13 @@ function speedMods(p, carrying) {
 function humanSpeed(s, p) {
   const carrying = isCarrier(s, p);
   let sp;
-  if (p.team !== ballTeamSafe(s) && !carrying) sp = Math.max(6.2 * PACE, baseSpeed(s, p)) + SPEED.HUMAN_DEF_BONUS;
+  const preThrowRush = !!s.friendly && !!s.play && !s.play.thrown && !s.play.handedOff && !s.play.kickoff;
+  if (p.team !== ballTeamSafe(s) && !carrying) sp = preThrowRush ? baseSpeed(s, p) : Math.max(6.2 * PACE, baseSpeed(s, p)) + SPEED.HUMAN_DEF_BONUS;
   else sp = baseSpeed(s, p);
+  if (preThrowRush && p.team !== s.possession && s.play && p.x < s.play.startLos + 1) {
+    const t = s.play.t;
+    sp *= t < FRIENDLY_HOLD_FULL ? FRIENDLY_HOLD_MIN : t < FRIENDLY_HOLD_END ? FRIENDLY_HOLD_MIN + (1 - FRIENDLY_HOLD_MIN) * (t - FRIENDLY_HOLD_FULL) / (FRIENDLY_HOLD_END - FRIENDLY_HOLD_FULL) : 1;
+  }
   if (carrying && roleOf(s, p) === "QB" && s.play && !s.play.thrown && s.play.chargeT > 0) sp = SPEED.QB_CHARGING;
   return sp * speedMods(p, carrying);
 }
@@ -5645,7 +5689,7 @@ function autoRunDir(s, p) {
   if (!play2 || s.phase !== "live" || !isCarrier(s, p)) return 0;
   if (play2.intercepted) return -1;
   const pdef = playById(play2.playId);
-  const inPocket = p.slot === OFF.QB && p.team === s.possession && !play2.kickoff && !play2.thrown && !play2.handedOff && pdef?.kind === "pass" && !play2.qbCrossed;
+  const inPocket = p.slot === OFF.QB && p.team === s.possession && !play2.kickoff && !play2.thrown && !play2.handedOff && pdef?.kind === "pass" && !play2.qbCrossed && !play2.scramble;
   if (inPocket) return 0;
   return p.team === s.possession ? 1 : -1;
 }
@@ -5904,6 +5948,11 @@ function stepMatch(s, inputs, dt = DT) {
       break;
     case "playcall": {
       s.phaseT -= dt;
+      runBetweenClock(s, dt);
+      if (!s.ot && !s.conv && s.clock <= 0) {
+        afterPlay(s);
+        break;
+      }
       const def = defTeam(s);
       if (pressed(def, "switchCount")) cycleDefender(s, def);
       if (s.calls[0] !== null && s.calls[1] !== null || s.phaseT <= 0) finishPlaycall(s);
@@ -5922,7 +5971,7 @@ function stepMatch(s, inputs, dt = DT) {
       stepKickAir(s, dt);
       break;
     case "kickoff":
-      stepKickoff(s, tapped, dt);
+      stepKickoff(s, tapped, dt, cur);
       break;
     case "dead":
       s.phaseT -= dt;
@@ -6027,6 +6076,13 @@ function afterPlay(s) {
   }
   if (!s.ot && s.clock <= 0) {
     const r3 = endOfHalf(s);
+    if (r3 === "quarter") {
+      s.lastResult = { kind: "gain", text: `END OF ${s.quarter === 2 ? "1ST" : "3RD"} QUARTER`, sub: s.quarter === 2 ? "2nd quarter" : "4th quarter", team: s.possession, yards: 0 };
+      s.resultSeq += 1;
+      emit(s, { type: "whistle" });
+      nextSeries(s);
+      return;
+    }
     if (r3 === "halftime") for (const p of s.players) p.stamina = Math.min(1, p.stamina + WEAR_HALFTIME);
     if (r3 === "final") {
       s.phase = "final";
@@ -6130,7 +6186,7 @@ function enterKick(s) {
   s.ball.z = 0;
   s.formationSeq += 1;
 }
-var MAX_KICK_LAG_TICKS = 8;
+var MAX_KICK_LAG_TICKS = 24;
 function kickLag(s, inp) {
   const vt = inp?.viewTick;
   if (vt === void 0 || vt < 0) return 0;
@@ -6256,7 +6312,7 @@ function enterKickoff(s) {
   s.ball.target = -1;
   s.formationSeq += 1;
 }
-function stepKickoff(s, tapped, dt) {
+function stepKickoff(s, tapped, dt, cur) {
   const k = s.kick;
   const kickTeam = defTeam(s);
   s.phaseT -= dt;
@@ -6271,16 +6327,17 @@ function stepKickoff(s, tapped, dt) {
     return;
   }
   kicker.x = Math.max(koSpot(s) + 1.5, kicker.x - 1.2 * dt);
-  if (!(tapped(kickTeam) && k.holdT > 0.15) && s.phaseT > 0) return;
-  launchKickoff(s);
+  const tap = tapped(kickTeam) && k.holdT > 0.15;
+  if (!tap && s.phaseT > 0) return;
+  launchKickoff(s, tap ? kickLag(s, cur?.[kickTeam]) : 0);
 }
-function launchKickoff(s) {
+function launchKickoff(s, lag = 0) {
   const k = s.kick;
   const kickTeam = defTeam(s);
   const recv = offTeam(s);
   const K = koSpot(s);
   k.released = true;
-  const m = kickMeter(k.holdT, KO_METER_HZ);
+  const m = kickMeter(Math.max(0, k.holdT - lag), KO_METER_HZ);
   k.power = (m + 1) / 2;
   const kd = koDistance(k.power) * (s.mods?.[kickTeam]?.kickPow ?? 1);
   const drift = (nextRandom(s) * 2 - 1) * KO_DRIFT;
@@ -6758,7 +6815,11 @@ function stepLive(s, inputs, pressed, dt) {
         emit(s, { type: "stiff_arm", team: side, x: p.x, y: p.y, v: 0 });
       }
     }
-    if (pressed(side, "diveCount") && p && isCar && p.diveT <= 0 && p.downT <= 0 && !(p.slot === OFF.QB && !play2.thrown && pdef?.kind === "pass" && !play2.qbCrossed)) {
+    const qbInPocket = !!p && isCar && p.slot === OFF.QB && !play2.thrown && pdef?.kind === "pass" && !play2.qbCrossed && !play2.scramble && !play2.handedOff && !play2.kickoff;
+    if (pressed(side, "diveCount") && qbInPocket && p.downT <= 0) {
+      play2.scramble = true;
+      emit(s, { type: "juke", team: side, x: p.x, y: p.y, v: 0 });
+    } else if (pressed(side, "diveCount") && p && isCar && p.diveT <= 0 && p.downT <= 0 && !qbInPocket) {
       const dir = p.team === s.possession && !play2.intercepted ? 1 : -1;
       p.lastDx = dir;
       p.lastDy = 0;
@@ -6973,6 +7034,10 @@ function playClockSeconds(s) {
 function armOf(s, side) {
   return s.qbArm?.[side] ?? 1;
 }
+var FRIENDLY_HOLD_MIN = 0.4;
+var FRIENDLY_HOLD_FULL = 2.5;
+var FRIENDLY_HOLD_END = 3.8;
+var SIDELINE_IN = 1.3;
 function throwBall(s, qb, ax, ay, passType, exact = false) {
   const play2 = s.play;
   const arm = armOf(s, qb.team);
@@ -7011,10 +7076,12 @@ function throwBall(s, qb, ax, ay, passType, exact = false) {
   const rr = r3 * Math.sqrt(nextRandom(s));
   let tx = qb.x + dx * aimDist + Math.cos(ang) * rr;
   let ty = qb.y + dy * aimDist + Math.sin(ang) * rr;
-  const d = clampThrowDist(Math.hypot(tx - qb.x, ty - qb.y), pt, arm);
+  const d0 = clampThrowDist(Math.hypot(tx - qb.x, ty - qb.y), pt, arm);
   const m2 = Math.hypot(tx - qb.x, ty - qb.y) || 1;
-  tx = qb.x + (tx - qb.x) / m2 * d;
-  ty = qb.y + (ty - qb.y) / m2 * d;
+  tx = qb.x + (tx - qb.x) / m2 * d0;
+  ty = qb.y + (ty - qb.y) / m2 * d0;
+  ty = Math.max(SIDELINE_IN, Math.min(FIELD_W - SIDELINE_IN, ty));
+  const d = Math.hypot(tx - qb.x, ty - qb.y);
   const spec = PASS_SPECS[pt];
   const b = s.ball;
   b.state = "air";
@@ -7542,7 +7609,7 @@ function applyBlocking(s, desired, dt) {
     d.vx *= 0.8;
     d.vy *= 0.8;
     const hold = (s.mods?.[bt]?.block ?? 1) / modOf(s, d, "rush");
-    const shed = (preThrow ? SHED_TIME_LINE : SHED_TIME_OPEN) * (human ? 0.8 : T(s, d.team).shedMult) * hold;
+    const shed = (preThrow ? SHED_TIME_LINE : SHED_TIME_OPEN) * (human ? s.friendly ? 1.3 : 0.8 : T(s, d.team).shedMult) * hold;
     if (d.engagedT >= shed) {
       d.engagedT = 0;
       d.shedT = SHED_IMMUNE;
@@ -7941,6 +8008,7 @@ function buildSnapshot(s, side, ack) {
     phaseT: r2(s.phaseT),
     clock: r2(s.clock),
     half: s.half,
+    quarter: s.quarter ?? (s.half === 2 ? 3 : 1),
     ot: s.ot ? s.ot.round : 0,
     score: [s.score[0], s.score[1]],
     poss: s.possession,
@@ -7987,7 +8055,7 @@ function buildSnapshot(s, side, ack) {
     playId: isOff ? play2?.playId ?? s.calls[side] : null,
     thrown: play2?.thrown ?? false,
     chargeT: isOff ? r2(play2?.chargeT ?? 0) : 0,
-    canThrow: isOff && s.phase === "live" && !!play2 && !play2.thrown && !play2.intercepted && pdef?.kind === "pass" && s.ball.state === "held" && s.ball.carrier === ctrl && s.players[ctrl]?.slot === 0 && s.players[ctrl].x < play2.startLos + 0.3,
+    canThrow: isOff && s.phase === "live" && !!play2 && !play2.thrown && !play2.intercepted && !play2.scramble && pdef?.kind === "pass" && s.ball.state === "held" && s.ball.carrier === ctrl && s.players[ctrl]?.slot === 0 && s.players[ctrl].x < play2.startLos + 0.3,
     defPref: s.defPref[side],
     result: s.lastResult ? { seq: s.resultSeq, kind: s.lastResult.kind, text: s.lastResult.text, sub: s.lastResult.sub, team: s.lastResult.team } : null,
     events: s.events.slice(),
@@ -8133,10 +8201,10 @@ var CpuBrain = class {
     const opts = offenseOptions(s);
     const me = this.side;
     const diff = s.score[me] - s.score[me === 0 ? 1 : 0];
-    const late = s.half === 2 && !s.ot && s.clock < 40;
+    const late = s.quarter === 4 && !s.ot && s.clock < 40;
     if (s.conv) {
       const chart = [-2, -5, -9, -10, -12, 1, 5];
-      const goForTwo = chart.includes(diff) && (s.half === 2 || s.ot) || this.rand() < 0.06;
+      const goForTwo = chart.includes(diff) && (s.quarter === 4 || s.ot) || this.rand() < 0.06;
       if (!goForTwo) return "xp";
       const near = PLAYS.filter((p) => ["slant", "stick", "outs", "levels", "qbpower", "dive", "pacross", "cross"].includes(p.id));
       return this.pick(near).id;
@@ -8144,7 +8212,7 @@ var CpuBrain = class {
     if (opts.includes("fg")) {
       const d = fgDistance(s.los);
       if (s.down === 4 && d <= 48 + this.opts.skill * 8) return "fg";
-      if (!s.ot && s.clock < 7 && (s.half === 1 || diff >= -3)) return "fg";
+      if (!s.ot && s.clock < 7 && (s.quarter === 2 || s.quarter === 4 && diff >= -3)) return "fg";
       if (s.ot && s.down === 4) return "fg";
     }
     if (s.down === 4) {
@@ -8158,7 +8226,7 @@ var CpuBrain = class {
     else cat = this.weighted({ run: 4, quick: 2.5, medium: 2.5, deep: 1, pa: 1.5 });
     let pool = PLAYS.filter((p) => p.cat === cat && opts.includes(p.id));
     if (this.rand() < (1 - this.opts.skill) * 0.5) pool = PLAYS.filter((p) => opts.includes(p.id));
-    const desperate = !s.ot && s.clock < 12 && (s.half === 1 || diff < 0) && s.los < 75;
+    const desperate = !s.ot && s.clock < 12 && (s.quarter === 2 || s.quarter === 4 && diff < 0) && s.los < 75;
     const situational = pool.filter((p) => (p.id !== "hailmary" || desperate) && (p.id !== "sneak" || s.toGo <= 1.5));
     if (situational.length) pool = situational;
     if (desperate && s.los < 70 && this.rand() < 0.6) {
@@ -8258,7 +8326,7 @@ var CpuBrain = class {
   }
   /** Should this CPU call a timeout right now? */
   wantsTimeout(s) {
-    if (s.ot || s.half !== 2 || s.timeouts[this.side] <= 0) return false;
+    if (s.ot || s.quarter !== 2 && s.quarter !== 4 || s.timeouts[this.side] <= 0) return false;
     if (s.phase !== "dead" || !s.clockRunsBetween || s.clock > 50 || s.clock < 1) return false;
     const me = this.side;
     const diff = s.score[me] - s.score[me === 0 ? 1 : 0];
@@ -8292,7 +8360,7 @@ var CpuBrain = class {
       this.audibleTried = false;
       this.readTime = 0.5 + (1 - skill) * 0.8 + this.rand() * 1;
       const me = this.side;
-      const hurry = s.half === 2 && s.clock < 40 && s.score[me] < s.score[me === 0 ? 1 : 0];
+      const hurry = s.quarter === 4 && s.clock < 40 && s.score[me] < s.score[me === 0 ? 1 : 0];
       this.hikeAt = hurry ? 0.7 : 0.8 + this.rand() * 1.8;
     }
     if (s.phase === "presnap") {
@@ -8813,7 +8881,7 @@ var Room = class {
     }
     this.matchId += 1;
     const kits = resolveKits([a.team, b.team], [a.kit, b.kit]);
-    this.match = createMatch({ teams: [a.team, b.team], kits, seed: randomInt(0, 2 ** 31), halfSeconds: this.cfg.halfSeconds, maxAudibles: [2, 2] });
+    this.match = createMatch({ teams: [a.team, b.team], kits, seed: randomInt(0, 2 ** 31), halfSeconds: this.cfg.halfSeconds, maxAudibles: [2, 2], friendly: true });
     this.match.aiDefense = this.aiDefenseAgreed;
     this.aiBrains = this.match.aiDefense ? [new CpuBrain(0, { skill: 0.7 }, randomInt(1, 1e9)), new CpuBrain(1, { skill: 0.7 }, randomInt(1, 1e9))] : null;
     this.phase = "match";
