@@ -3890,7 +3890,7 @@ var ACC_MOVING_MULT = 1.35;
 var PASS_SPECS = [
   { name: "BULLET", maxDist: 28, dur: (d) => 0.22 + d / 34, peak: (d) => 0.45 + d * 0.035, acc: 1.2, catchR: 1.25 },
   { name: "TOUCH", maxDist: 38, dur: (d) => 0.35 + d / 24, peak: (d) => 1.2 + d * 0.12, acc: 1, catchR: 1.4 },
-  { name: "LOB", maxDist: 46, dur: (d) => 0.55 + d / 17, peak: (d) => 2.4 + d * 0.22, acc: 1, catchR: 1.55 }
+  { name: "FLOATER", maxDist: 46, dur: (d) => 0.55 + d / 17, peak: (d) => 2.4 + d * 0.22, acc: 1, catchR: 1.55 }
 ];
 var THROW_MAX_DIST = PASS_SPECS[2].maxDist;
 var LONG_THROW_FROM = 25;
@@ -3898,19 +3898,31 @@ var ACC_LONG_PER_YARD = 0.05;
 function maxThrowDist(passType = 1, arm = 1) {
   return (PASS_SPECS[passType] ?? PASS_SPECS[1]).maxDist * arm;
 }
-function accuracyRadius(dist2, pressured, moving, passType = 1, qbAcc = 1) {
-  const spec = PASS_SPECS[passType] ?? PASS_SPECS[1];
+function throwLoft(dist2) {
+  return Math.max(0, Math.min(1, (dist2 - LOFT_FROM) / (LOFT_TO - LOFT_FROM)));
+}
+var LOFT_FROM = 6;
+var LOFT_TO = 40;
+function blendSpec(dist2, f) {
+  const u = throwLoft(dist2) * 2;
+  return u <= 1 ? f(PASS_SPECS[0]) + (f(PASS_SPECS[1]) - f(PASS_SPECS[0])) * u : f(PASS_SPECS[1]) + (f(PASS_SPECS[2]) - f(PASS_SPECS[1])) * (u - 1);
+}
+function catchRadius(dist2) {
+  return blendSpec(dist2, (s) => s.catchR);
+}
+function accuracyRadius(dist2, pressured, moving, _passType = 1, qbAcc = 1) {
+  const acc = blendSpec(dist2, (s) => s.acc);
   const long = Math.max(0, dist2 - LONG_THROW_FROM) * ACC_LONG_PER_YARD;
-  return (ACC_BASE + ACC_PER_YARD * dist2 + long) * spec.acc * (pressured ? ACC_PRESSURE_MULT : 1) * (moving ? ACC_MOVING_MULT : 1) / Math.max(0.4, qbAcc);
+  return (ACC_BASE + ACC_PER_YARD * dist2 + long) * acc * (pressured ? ACC_PRESSURE_MULT : 1) * (moving ? ACC_MOVING_MULT : 1) / Math.max(0.4, qbAcc);
 }
 function clampThrowDist(d, passType = 1, arm = 1) {
   return Math.max(THROW_MIN_DIST, Math.min(maxThrowDist(passType, arm), d));
 }
-function throwDuration(dist2, passType = 1) {
-  return (PASS_SPECS[passType] ?? PASS_SPECS[1]).dur(dist2);
+function throwDuration(dist2, _passType = 1) {
+  return blendSpec(dist2, (s) => s.dur(dist2));
 }
-function throwPeak(dist2, passType = 1) {
-  return (PASS_SPECS[passType] ?? PASS_SPECS[1]).peak(dist2);
+function throwPeak(dist2, _passType = 1) {
+  return blendSpec(dist2, (s) => s.peak(dist2));
 }
 function ballZ(f, peak) {
   return 1.5 * (1 - f) + 4 * peak * f * (1 - f);
@@ -7082,7 +7094,7 @@ function throwBall(s, qb, ax, ay, passType, exact = false) {
   ty = qb.y + (ty - qb.y) / m2 * d0;
   ty = Math.max(SIDELINE_IN, Math.min(FIELD_W - SIDELINE_IN, ty));
   const d = Math.hypot(tx - qb.x, ty - qb.y);
-  const spec = PASS_SPECS[pt];
+  const catchR = catchRadius(d);
   const b = s.ball;
   b.state = "air";
   b.carrier = -1;
@@ -7111,7 +7123,7 @@ function throwBall(s, qb, ax, ay, passType, exact = false) {
   for (let k = 0; k < TEAM_SIZE && !snapTo; k++) {
     if (k === OFF.QB || k === OFF.OL1 || k === OFF.OL2) continue;
     const p = s.players[pidx(offTeam(s), k)];
-    const reach = baseSpeed(s, p) * b.dur * 0.95 + spec.catchR;
+    const reach = baseSpeed(s, p) * b.dur * 0.95 + catchR;
     const slack = reach - dist(p.x, p.y, b.tx, b.ty);
     if (slack > bestSlack) {
       bestSlack = slack;
@@ -7145,7 +7157,7 @@ function updateBall(s, dt) {
   b.z = ballZ(f, b.peak);
   if (f >= CATCHABLE_FROM) {
     const off = offTeam(s);
-    const spec = PASS_SPECS[b.passType] ?? PASS_SPECS[1];
+    const catchR = catchRadius(dist(b.sx, b.sy, b.tx, b.ty));
     let best = null;
     let bestScore = Infinity;
     for (const p of s.players) {
@@ -7157,7 +7169,7 @@ function updateBall(s, dt) {
       const reach = p.diveT > 0 ? 1.6 : isOff ? REACH_OFF : jumping ? REACH_DEF_HUMAN + 0.5 : human ? REACH_DEF_HUMAN : REACH_DEF;
       if (b.z > reach) continue;
       const aiDef = !isOff && !(human && s.aiLevel[p.team] === null);
-      const r3 = isOff ? spec.catchR : jumping ? INT_JUMP_R : p.diveT > 0 ? TACKLE_R_DIVE * 0.85 : aiDef ? T(s, p.team).ballReach : CATCH_R_DEF_HUMAN;
+      const r3 = isOff ? catchR : jumping ? INT_JUMP_R : p.diveT > 0 ? TACKLE_R_DIVE * 0.85 : aiDef ? T(s, p.team).ballReach : CATCH_R_DEF_HUMAN;
       const d = dist(p.x, p.y, b.x, b.y);
       if (d <= r3 && d / r3 < bestScore) {
         bestScore = d / r3;
