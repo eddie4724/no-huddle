@@ -3854,6 +3854,10 @@ var SPEED = {
 var CARRY_MULT = 0.96;
 var ACCEL = 20.5;
 var DECEL = 26;
+var HUMAN_ACCEL = 40;
+var HUMAN_DECEL = 46;
+var FUMBLE_CHANCE = 0.01;
+var FUMBLE_DEF_RECOVER = 0.55;
 var FATIGUE_CARRY = 0.17;
 var FATIGUE_OTHER = 0.05;
 var FATIGUE_SLOW = 0.22;
@@ -4235,6 +4239,24 @@ function applyOutcome(s, o) {
       }
       break;
     }
+    case "fumble_lost": {
+      changed = true;
+      if (o.spot <= 0) {
+        s.score[def] += TD_POINTS;
+        s.stats[def].tds += 1;
+        res = result("fumble", "FUMBLE! TOUCHDOWN!", `${defName} +6`, def);
+        scored = true;
+        startConversion(s, def);
+      } else if (s.ot) {
+        res = result("fumble", "FUMBLE!", `${defName} recover \xB7 Overtime possession over`, def);
+        endPossession(s, def, OT_START_LOS);
+      } else {
+        const spot = clampLos(o.spot);
+        res = result("fumble", "FUMBLE!", `${defName} recover at the ${fieldPosText(FIELD_LEN - spot).toLowerCase()}`, def);
+        endPossession(s, def, FIELD_LEN - spot);
+      }
+      break;
+    }
     case "ko_return": {
       const punt = !!s.play?.punt;
       const tb = punt ? TOUCHBACK_LOS : KO_TOUCHBACK_LOS;
@@ -4246,7 +4268,7 @@ function applyOutcome(s, o) {
         const ret = Math.round(spot - startLos);
         s.stats[off].retYds += Math.max(0, ret);
         const what = punt ? ret > 0 ? `${ret}-YARD PUNT RETURN` : "PUNT DOWNED" : `${Math.max(0, ret)}-YARD RETURN`;
-        res = result("gain", what, `${offName} ball at the ${fieldPosText(spot).toLowerCase()}`, off, ret);
+        res = result("gain", o.fumble ? "FUMBLE!" : what, `${o.fumble ? `${offName} recover \xB7 ` : ""}${offName} ball at the ${fieldPosText(spot).toLowerCase()}`, off, ret);
         startPossession(s, off, spot);
       }
       break;
@@ -4316,6 +4338,9 @@ function applyOutcome(s, o) {
       }
       if (o.sack) s.stats[def].sacks += 1;
       s.clockRunsBetween = !o.oob && !s.ot;
+      if (o.fumble && (res.kind === "gain" || res.kind === "loss" || res.kind === "first_down" || res.kind === "sack" || res.kind === "out_of_bounds")) {
+        res = { ...res, text: "FUMBLE!", sub: `${offName} recover \xB7 ${res.kind === "first_down" ? "FIRST DOWN \xB7 " : ""}${ydsText}` };
+      }
       break;
     }
   }
@@ -4514,7 +4539,8 @@ var EVENT_TYPES = [
   "kickoff",
   "touchback",
   "injury",
-  "kick_power"
+  "kick_power",
+  "fumble"
 ];
 function snapshotToWire(s, includeStats) {
   const p = [];
@@ -5725,13 +5751,16 @@ function steerVelocity(mx, my, sp, dir) {
 function ballTeamSafe(s) {
   return s.play ? ballTeam(s) : s.possession;
 }
-function applyMomentum(vx, vy, dvx, dvy, dt) {
+function applyMomentum(vx, vy, dvx, dvy, dt, person = false) {
   const ex = dvx - vx;
   const ey = dvy - vy;
   const e = Math.hypot(ex, ey);
   if (e < 1e-6) return [dvx, dvy];
-  const slowing = Math.hypot(dvx, dvy) < Math.hypot(vx, vy) - 0.01;
-  const lim = (slowing ? DECEL : ACCEL) * dt;
+  const cur = Math.hypot(vx, vy);
+  const want = Math.hypot(dvx, dvy);
+  const slowing = want < cur - 0.01;
+  const cutting = person && cur > 1 && (want < 0.5 || (vx * dvx + vy * dvy) / (cur * Math.max(want, 1e-6)) < 0.8);
+  const lim = (slowing ? cutting ? HUMAN_DECEL : DECEL : cutting ? HUMAN_ACCEL : ACCEL) * dt;
   if (e <= lim) return [dvx, dvy];
   return [vx + ex / e * lim, vy + ey / e * lim];
 }
@@ -6951,7 +6980,9 @@ function stepLive(s, inputs, pressed, dt) {
   applyBlocking(s, desired, dt);
   for (const p of s.players) {
     const [dvx, dvy] = desired[p.idx];
-    if (p.diveT <= 0 && p.downT <= 0) [p.vx, p.vy] = applyMomentum(p.vx, p.vy, dvx, dvy, dt);
+    const steered = inputs[p.team].mx !== 0 || inputs[p.team].my !== 0;
+    const person = steered && s.control[p.team] === p.idx && s.aiLevel[p.team] === null && !(p.mode === "carry" && !play2.handedOff);
+    if (p.diveT <= 0 && p.downT <= 0) [p.vx, p.vy] = applyMomentum(p.vx, p.vy, dvx, dvy, dt, person);
     const sp = Math.hypot(p.vx, p.vy);
     const carrying = isCarrier(s, p);
     const top = baseSpeed(s, p);
@@ -7458,9 +7489,20 @@ function endPlayDown(s, c, oob, tackler) {
       }
     }
   }
+  let fumble = null;
+  const roll = { rng: s.rng ^ Math.imul(s.tick + 1, 2654435761) ^ Math.imul(c.idx + 7, 2246822507) | 0 };
+  if (tackler >= 0 && !oob && !play2.intercepted && !s.conv && nextRandom(roll) < FUMBLE_CHANCE) {
+    fumble = nextRandom(roll) < FUMBLE_DEF_RECOVER ? "lost" : "kept";
+    emit(s, { type: "fumble", team: fumble === "lost" ? other(c.team) : c.team, x: c.x, y: c.y });
+    if (fumble === "lost") {
+      emit(s, { type: "tackle", team: other(c.team), x: c.x, y: c.y });
+      endPlay(s, { kind: "fumble_lost", spot: c.x });
+      return;
+    }
+  }
   if (play2.kickoff) {
     emit(s, { type: "tackle", team: other(c.team), x: c.x, y: c.y });
-    endPlay(s, { kind: "ko_return", spot: c.x, oob });
+    endPlay(s, { kind: "ko_return", spot: c.x, oob, fumble: fumble === "kept" });
     return;
   }
   if (play2.intercepted) {
@@ -7472,7 +7514,7 @@ function endPlayDown(s, c, oob, tackler) {
   const pdef = playById(play2.playId);
   const sack = pdef?.kind === "pass" && !play2.thrown && !play2.handedOff && c.slot === OFF.QB && c.team === off && c.x < play2.startLos;
   emit(s, { type: sack ? "sack" : "tackle", team: other(off), x: c.x, y: c.y });
-  endPlay(s, { kind: "down", spot: c.x, oob, sack, via: play2.via });
+  endPlay(s, { kind: "down", spot: c.x, oob, sack, via: play2.via, fumble: fumble === "kept" });
 }
 function endPlay(s, o) {
   const play2 = s.play;
